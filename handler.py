@@ -148,5 +148,5 @@ def handler(job):
     return result
 
 
-if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+# Start the RunPod serverless worker (top-level so RunPod can detect it).
+runpod.serverless.start({"handler": handler})
