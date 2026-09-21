@@ -19,12 +19,15 @@ import runpod
 import torch
 
 from prompts import CAPTION_SYSTEM, IMAGE_PROMPT_SYSTEM, TRANSLATE_SYSTEM
-from tts_engine import TtsEngine
 
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 LLM_4BIT = os.getenv("LLM_4BIT", "false").lower() == "true"
 MAX_TTS_CHARS = int(os.getenv("MAX_TTS_CHARS", "3000"))
 DEVICE = "cuda"
+# TTS is opt-in: its model pins torch==2.6.0 / transformers==4.46.3, which cannot load Qwen3
+# (needs transformers>=4.51). Enable it only with an image built with --build-arg WITH_TTS=true
+# and a compatible LLM_MODEL, or run it as a separate worker.
+ENABLE_TTS = os.getenv("ENABLE_TTS", "false").lower() == "true"
 
 if os.path.isdir("/runpod-volume"):
     os.environ.setdefault("HF_HOME", "/runpod-volume/huggingface")
@@ -47,11 +50,30 @@ def load_llm():
     return AutoModelForCausalLM.from_pretrained(LLM_MODEL, **kwargs).eval(), AutoTokenizer.from_pretrained(LLM_MODEL)
 
 
+def check_gpu() -> None:
+    """Fail fast with a readable message instead of a confusing CUDA error deep inside model loading."""
+    print(f"[boot] torch {torch.__version__} (built for CUDA {torch.version.cuda})", flush=True)
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "No usable GPU: torch.cuda.is_available() is False. Usual causes: the RunPod host's NVIDIA "
+            "driver is older than this image's CUDA build (set the endpoint's 'Allowed CUDA versions' to "
+            f"{torch.version.cuda} or higher, or rebuild on an older CUDA base image), or the endpoint "
+            "has no GPU type selected / the selected GPU type has no capacity."
+        )
+    props = torch.cuda.get_device_properties(0)
+    print(f"[boot] GPU: {props.name}, {props.total_memory / 1e9:.1f} GB", flush=True)
+
+
 t0 = time.time()
+check_gpu()
 print(f"[boot] loading LLM {LLM_MODEL} (4bit={LLM_4BIT})", flush=True)
 LLM, TOKENIZER = load_llm()
-print("[boot] loading Bangla TTS", flush=True)
-TTS = TtsEngine()
+TTS = None
+if ENABLE_TTS:
+    print("[boot] loading Bangla TTS", flush=True)
+    from tts_engine import TtsEngine
+
+    TTS = TtsEngine()
 print(f"[boot] ready in {time.time() - t0:.1f}s, VRAM {torch.cuda.memory_allocated() / 1e9:.1f} GB", flush=True)
 
 
@@ -108,6 +130,8 @@ def task_caption(inp: dict) -> dict:
 
 
 def task_tts(inp: dict) -> dict:
+    if TTS is None:
+        raise ValueError("tts is disabled on this worker (needs an image built with WITH_TTS=true and ENABLE_TTS=true)")
     text = inp["text"].strip()
     if len(text) > MAX_TTS_CHARS:
         raise ValueError(f"text too long ({len(text)} chars, max {MAX_TTS_CHARS})")
